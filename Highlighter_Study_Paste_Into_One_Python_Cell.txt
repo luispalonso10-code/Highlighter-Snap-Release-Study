@@ -1,0 +1,1433 @@
+# Paste this entire file into ONE Python notebook code cell.
+# It contains top-level await for browser package loading.
+# It is not intended for execution as a terminal .py script.
+
+import sys
+import warnings
+from pathlib import Path
+import json
+
+# Browser Pyodide: load scientific packages before importing them.
+if sys.platform == "emscripten":
+    import pyodide_js
+    for package in ("numpy", "pandas", "matplotlib"):
+        await pyodide_js.loadPackage(package)
+
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+from IPython.display import display
+
+# Narrow workaround for a known rendering compatibility warning.
+warnings.filterwarnings(
+    "ignore",
+    message=r"The (x|y) parameter as float was deprecated in Matplotlib 3\.10.*",
+    category=matplotlib.MatplotlibDeprecationWarning,
+)
+print("Python:", sys.version)
+print("NumPy:", np.__version__)
+print("pandas:", pd.__version__)
+print("Matplotlib:", matplotlib.__version__)
+
+
+# ============================================================
+# THREE-HIGHLIGHTER SNAP-RELEASE STUDY
+#
+# Study target:
+# Initial motion of the middle highlighter after both
+# side-by-side connections have released.
+#
+# All simulated inputs below are illustrative assumptions.
+# ============================================================
+
+SEED = 20261112
+TRIALS_PER_SCENARIO = 10_000
+
+OUTPUT_DIR = Path("highlighter_release_results")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+assert TRIALS_PER_SCENARIO >= 12
+rng = np.random.default_rng(SEED)
+
+# Coordinate convention:
+# +x = right
+# +y = up
+#
+# "Initial direction" means the direction immediately after
+# release, not the direction after a long fall.
+
+# Air: x-y is a vertical plane; gravity acts along -y.
+# Ideal plane: an ideal frictionless horizontal surface viewed
+# from above; "up" and "down" are directions on the page.
+ENVIRONMENT = "air"
+
+if ENVIRONMENT == "air":
+    GRAVITY_Y = -9.81
+elif ENVIRONMENT == "ideal_plane":
+    GRAVITY_Y = 0.0
+else:
+    raise ValueError(
+        "ENVIRONMENT must be 'air' or 'ideal_plane'."
+    )
+
+# Observation horizon after complete release.
+OBSERVATION_TIME_S = 0.10
+
+# A classification threshold, not a physical law.
+# Motion slower than this is called "nearly stationary".
+STATIONARY_SPEED_M_S = 0.02
+
+# Illustrative mass distribution: 20 g ± 1 g.
+# Values below the minimum are clamped to that minimum.
+MASS_MEAN_KG = 0.020
+MASS_SD_KG = 0.001
+MASS_MIN_KG = 0.010
+
+# Pre-release center-of-mass velocity assumptions.
+# Both default to zero, but downward pre-motion can be tested.
+INITIAL_VX_MEAN_M_S = 0.0
+INITIAL_VY_MEAN_M_S = 0.0
+INITIAL_VELOCITY_SD_M_S = 0.005
+
+# Mirrored horizontal impulse magnitude from each connector.
+# Left connector acts toward -x; right connector toward +x.
+HORIZONTAL_IMPULSE_MEAN_NS = 0.002
+HORIZONTAL_IMPULSE_SD_NS = 0.0003
+
+# Correlation between corresponding connector impulses.
+# Positive correlation makes their behavior more alike.
+CONNECTOR_CORRELATION = 0.8
+
+# Separate hypothetical mechanisms.
+# Positive vertical impulse means an upward push on the middle.
+# Negative vertical impulse means a downward push.
+#
+# These are NOT assigned real-world occurrence probabilities.
+SCENARIOS = {
+    "downward_drag": {
+        "vertical_impulse_mean_per_side_Ns": -0.003,
+        "vertical_impulse_sd_per_side_Ns": 0.001,
+    },
+    "upward_recoil": {
+        "vertical_impulse_mean_per_side_Ns": 0.003,
+        "vertical_impulse_sd_per_side_Ns": 0.001,
+    },
+    "near_balanced_release": {
+        "vertical_impulse_mean_per_side_Ns": 0.0,
+        "vertical_impulse_sd_per_side_Ns": 0.0003,
+    },
+}
+
+DIRECTION_ORDER = [
+    "up",
+    "down",
+    "left",
+    "right",
+    "nearly_stationary",
+]
+
+def correlated_pair(mean, sd, count):
+    """Two normally distributed inputs with chosen correlation."""
+    first_noise = rng.normal(size=count)
+    second_noise = rng.normal(size=count)
+
+    left = mean + sd * first_noise
+
+    right = mean + sd * (
+        CONNECTOR_CORRELATION * first_noise
+        + np.sqrt(1.0 - CONNECTOR_CORRELATION**2)
+        * second_noise
+    )
+
+    return left, right
+
+
+def classify_direction(vx, vy):
+    """
+    Assign the dominant cardinal direction.
+
+    Diagonal motion is assigned to its larger component.
+    Near-stationary motion is handled separately.
+    """
+    vx = np.asarray(vx)
+    vy = np.asarray(vy)
+
+    speed = np.hypot(vx, vy)
+    vertical_dominates = np.abs(vy) >= np.abs(vx)
+
+    labels = np.where(
+        vertical_dominates,
+        np.where(vy >= 0.0, "up", "down"),
+        np.where(vx >= 0.0, "right", "left"),
+    )
+
+    return np.where(
+        speed < STATIONARY_SPEED_M_S,
+        "nearly_stationary",
+        labels,
+    )
+
+
+def wilson_interval(successes, total, z=1.96):
+    """
+    Approximate 95% interval for Monte Carlo sampling error.
+    Does not include uncertainty about the physical model.
+    """
+    p = successes / total
+    denominator = 1.0 + z**2 / total
+
+    center = (
+        p + z**2 / (2.0 * total)
+    ) / denominator
+
+    half_width = (
+        z
+        * np.sqrt(
+            p * (1.0 - p) / total
+            + z**2 / (4.0 * total**2)
+        )
+        / denominator
+    )
+
+    return (
+        max(0.0, center - half_width),
+        min(1.0, center + half_width),
+    )
+
+
+trial_tables = []
+
+for scenario_name, parameters in SCENARIOS.items():
+    n = TRIALS_PER_SCENARIO
+    assert n >= 12
+
+    mass = np.maximum(
+        rng.normal(MASS_MEAN_KG, MASS_SD_KG, n),
+        MASS_MIN_KG,
+    )
+
+    vx_before = rng.normal(
+        INITIAL_VX_MEAN_M_S,
+        INITIAL_VELOCITY_SD_M_S,
+        n,
+    )
+
+    vy_before = rng.normal(
+        INITIAL_VY_MEAN_M_S,
+        INITIAL_VELOCITY_SD_M_S,
+        n,
+    )
+
+    horizontal_left, horizontal_right = correlated_pair(
+        HORIZONTAL_IMPULSE_MEAN_NS,
+        HORIZONTAL_IMPULSE_SD_NS,
+        n,
+    )
+
+    # Enforce the assumed mirrored horizontal directions.
+    jx_left = -np.maximum(horizontal_left, 0.0)
+    jx_right = np.maximum(horizontal_right, 0.0)
+
+    jy_left, jy_right = correlated_pair(
+        parameters["vertical_impulse_mean_per_side_Ns"],
+        parameters["vertical_impulse_sd_per_side_Ns"],
+        n,
+    )
+
+    jx_net = jx_left + jx_right
+    jy_net = jy_left + jy_right
+
+    # Connector impulses encode the short release event.
+    # Gravity during that short event is neglected.
+    vx_after = vx_before + jx_net / mass
+    vy_after = vy_before + jy_net / mass
+
+    speed_after = np.hypot(vx_after, vy_after)
+
+    initial_direction = classify_direction(
+        vx_after,
+        vy_after,
+    )
+
+    # Post-release motion:
+    # no more connector forces; only selected gravity.
+    t = OBSERVATION_TIME_S
+
+    dx = vx_after * t
+    dy = vy_after * t + 0.5 * GRAVITY_Y * t**2
+
+    vy_at_observation = vy_after + GRAVITY_Y * t
+
+    # Displacement direction can differ from launch direction.
+    # Use average velocity to apply the same speed threshold.
+    displacement_direction = classify_direction(
+        dx / t,
+        dy / t,
+    )
+
+    # Diagonal flag: smaller component is at least half
+    # the larger component, excluding near-stationary trials.
+    smaller_component = np.minimum(
+        np.abs(vx_after),
+        np.abs(vy_after),
+    )
+
+    larger_component = np.maximum(
+        np.abs(vx_after),
+        np.abs(vy_after),
+    )
+
+    diagonal = (
+        (speed_after >= STATIONARY_SPEED_M_S)
+        & (smaller_component >= 0.5 * larger_component)
+    )
+
+    trial_tables.append(
+        pd.DataFrame({
+            "data_type": "synthetic",
+            "scenario": scenario_name,
+            "trial": np.arange(1, n + 1),
+            "mass_kg": mass,
+            "vx_before_m_s": vx_before,
+            "vy_before_m_s": vy_before,
+            "jx_left_Ns": jx_left,
+            "jx_right_Ns": jx_right,
+            "jy_left_Ns": jy_left,
+            "jy_right_Ns": jy_right,
+            "jx_net_Ns": jx_net,
+            "jy_net_Ns": jy_net,
+            "vx_after_m_s": vx_after,
+            "vy_after_m_s": vy_after,
+            "speed_after_m_s": speed_after,
+            "initial_direction": initial_direction,
+            "diagonal_motion": diagonal,
+            "observation_time_s": t,
+            "dx_at_observation_m": dx,
+            "dy_at_observation_m": dy,
+            "vy_at_observation_m_s": vy_at_observation,
+            "displacement_direction": displacement_direction,
+        })
+    )
+
+trials = pd.concat(trial_tables, ignore_index=True)
+
+summary_rows = []
+
+for scenario_name, group in trials.groupby(
+    "scenario",
+    sort=False,
+):
+    for outcome_column in (
+        "initial_direction",
+        "displacement_direction",
+    ):
+        for direction in DIRECTION_ORDER:
+            count = int(
+                (group[outcome_column] == direction).sum()
+            )
+
+            low, high = wilson_interval(count, len(group))
+
+            summary_rows.append({
+                "scenario": scenario_name,
+                "outcome": outcome_column,
+                "direction": direction,
+                "count": count,
+                "total_trials": len(group),
+                "probability": count / len(group),
+                "mc_95_low": low,
+                "mc_95_high": high,
+            })
+
+probability_summary = pd.DataFrame(summary_rows)
+
+# Confirm that all outcomes were classified.
+probability_totals = probability_summary.groupby(
+    ["scenario", "outcome"]
+)["probability"].sum()
+
+assert np.allclose(probability_totals.to_numpy(), 1.0)
+
+# Check exact horizontal cancellation in the ideal limit.
+assert np.isclose(
+    -HORIZONTAL_IMPULSE_MEAN_NS
+    + HORIZONTAL_IMPULSE_MEAN_NS,
+    0.0,
+)
+
+# Save example post-release trajectories.
+trajectory_times = np.linspace(
+    0.0,
+    OBSERVATION_TIME_S,
+    101,
+)
+
+trajectory_tables = []
+
+for scenario_name, group in trials.groupby(
+    "scenario",
+    sort=False,
+):
+    examples = group.sample(
+        n=12,
+        random_state=SEED,
+    )
+
+    for _, row in examples.iterrows():
+        trajectory_tables.append(
+            pd.DataFrame({
+                "scenario": scenario_name,
+                "trial": int(row["trial"]),
+                "time_after_release_s": trajectory_times,
+                "x_m": (
+                    row["vx_after_m_s"] * trajectory_times
+                ),
+                "y_m": (
+                    row["vy_after_m_s"] * trajectory_times
+                    + 0.5 * GRAVITY_Y * trajectory_times**2
+                ),
+            })
+        )
+
+trajectory_data = pd.concat(
+    trajectory_tables,
+    ignore_index=True,
+)
+
+assumptions = {
+    "data_type": "synthetic; not experimental measurements",
+    "seed": SEED,
+    "trials_per_scenario": TRIALS_PER_SCENARIO,
+    "environment": ENVIRONMENT,
+    "gravity_y_m_s2": GRAVITY_Y,
+    "observation_time_s": OBSERVATION_TIME_S,
+    "stationary_speed_threshold_m_s": STATIONARY_SPEED_M_S,
+    "mass_mean_kg": MASS_MEAN_KG,
+    "mass_sd_kg": MASS_SD_KG,
+    "mass_min_kg": MASS_MIN_KG,
+    "initial_vx_mean_m_s": INITIAL_VX_MEAN_M_S,
+    "initial_vy_mean_m_s": INITIAL_VY_MEAN_M_S,
+    "initial_velocity_sd_m_s": INITIAL_VELOCITY_SD_M_S,
+    "horizontal_impulse_mean_per_side_Ns":
+        HORIZONTAL_IMPULSE_MEAN_NS,
+    "horizontal_impulse_sd_per_side_Ns":
+        HORIZONTAL_IMPULSE_SD_NS,
+    "connector_correlation": CONNECTOR_CORRELATION,
+    "scenarios": SCENARIOS,
+    "scenario_occurrence_weights": None,
+    "limitations": [
+        "Only middle-highlighter translation is modeled.",
+        "Connector impulses are assumed, not measured.",
+        "Release is represented as an instantaneous event.",
+        "Rotation, collisions, friction, and air drag omitted.",
+        "No ground collision is modeled in air mode.",
+        "No physical frequency assigned to the scenarios.",
+    ],
+}
+
+trials.to_csv(
+    OUTPUT_DIR / "synthetic_release_trials.csv",
+    index=False,
+)
+
+probability_summary.to_csv(
+    OUTPUT_DIR / "conditional_direction_probabilities.csv",
+    index=False,
+)
+
+trajectory_data.to_csv(
+    OUTPUT_DIR / "example_post_release_trajectories.csv",
+    index=False,
+)
+
+with (OUTPUT_DIR / "model_assumptions.json").open(
+    "w",
+    encoding="utf-8",
+) as file:
+    json.dump(assumptions, file, indent=2)
+
+# Blank template for genuine experimental measurements.
+experiment_columns = [
+    "trial_id",
+    "environment",
+    "middle_mass_kg",
+    "video_frame_rate_fps",
+    "length_scale_m_per_pixel",
+    "release_frame",
+    "vx_before_m_s",
+    "vy_before_m_s",
+    "vx_after_m_s",
+    "vy_after_m_s",
+    "left_release_frame",
+    "right_release_frame",
+    "notes",
+]
+
+template_path = OUTPUT_DIR / "experimental_measurements_template.csv"
+
+# Avoid overwriting a template that the user has already filled.
+if not template_path.exists():
+    pd.DataFrame(
+        columns=experiment_columns
+    ).to_csv(template_path, index=False)
+
+initial_probabilities = (
+    probability_summary[
+        probability_summary["outcome"] == "initial_direction"
+    ]
+    .pivot(
+        index="scenario",
+        columns="direction",
+        values="probability",
+    )
+    .reindex(
+        index=list(SCENARIOS),
+        columns=DIRECTION_ORDER,
+    )
+)
+
+print("Simulation completed.")
+print(f"Synthetic trials: {len(trials):,}")
+print(f"Environment: {ENVIRONMENT}")
+print("\nInitial-direction percentages, conditional on scenario:")
+
+display((100.0 * initial_probabilities).round(2))
+
+print("\nOutput directory:", OUTPUT_DIR.resolve())
+print(
+    "\nThese are model-conditional probabilities, "
+    "not measured probabilities for the real highlighters."
+)
+# Preserve the generating configuration independently of live variables.
+import copy
+RUN_CONFIGURATION = copy.deepcopy(assumptions)
+RUN_CONFIGURATION["software"] = {
+    "python": sys.version,
+    "numpy": np.__version__,
+    "pandas": pd.__version__,
+    "matplotlib": matplotlib.__version__,
+}
+with (OUTPUT_DIR / "model_assumptions.json").open("w", encoding="utf-8") as file:
+    json.dump(RUN_CONFIGURATION, file, indent=2)
+
+
+# Verification checks test mathematics, not real-world validity.
+test_results = []
+
+def check(name, condition):
+    passed = bool(condition)
+    test_results.append({"test": name, "passed": passed})
+    assert passed, name
+
+m_test = 0.020
+v_test = np.array([0.03, -0.04])
+j_left = np.array([-0.002, 0.003])
+j_right = np.array([0.002, 0.003])
+
+check("zero impulse leaves velocity unchanged",
+      np.allclose(v_test + np.zeros(2) / m_test, v_test))
+check("mirrored horizontal impulses cancel in velocity update",
+      np.isclose((v_test + (j_left + j_right) / m_test)[0], v_test[0]))
+check("known vertical impulse gives expected velocity",
+      np.isclose(((j_left + j_right) / m_test)[1], 0.3))
+
+expected = np.array(["up", "down", "left", "right", "nearly_stationary"])
+actual = classify_direction(
+    np.array([0, 0, -0.1, 0.1, 0]),
+    np.array([0.1, -0.1, 0, 0, 0]),
+)
+check("cardinal classification", np.array_equal(actual, expected))
+check("stationary boundary is strict less-than",
+      classify_direction(np.array([STATIONARY_SPEED_M_S]), np.array([0.0]))[0] == "right")
+
+check("probability groups sum to one",
+      np.allclose(probability_summary.groupby(["scenario", "outcome"])["probability"].sum(), 1))
+check("trial count", len(trials) == len(SCENARIOS) * TRIALS_PER_SCENARIO)
+check("finite velocities", np.isfinite(trials[["vx_after_m_s", "vy_after_m_s"]]).all().all())
+check("impulse momentum consistency x", np.allclose(
+    trials["mass_kg"] * (trials["vx_after_m_s"] - trials["vx_before_m_s"]), trials["jx_net_Ns"]))
+check("impulse momentum consistency y", np.allclose(
+    trials["mass_kg"] * (trials["vy_after_m_s"] - trials["vy_before_m_s"]), trials["jy_net_Ns"]))
+check("trajectory begins at release origin",
+      np.allclose(trajectory_data.loc[trajectory_data["time_after_release_s"] == 0, ["x_m", "y_m"]], 0))
+check("gravity-only trajectory", np.isclose(0.5 * (-9.81) * 0.1**2, -0.04905))
+
+verification = pd.DataFrame(test_results)
+verification.to_csv(OUTPUT_DIR / "verification_checks.csv", index=False)
+display(verification)
+print(f"Passed {len(verification)} verification checks. Physical validation remains separate.")
+
+
+# Comparable scales and explicit Monte Carlo uncertainty.
+scenario_names = list(SCENARIOS)
+scenario_colors = dict(zip(scenario_names, ["#D35400", "#2471A3", "#229954"]))
+direction_colors = ["#2874A6", "#C0392B", "#8E44AD", "#D68910", "#707B7C"]
+
+def save_figure(fig, name):
+    fig.savefig(OUTPUT_DIR / name, dpi=180, bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 5.5))
+x = np.arange(len(scenario_names))
+width = 0.15
+for k, direction in enumerate(DIRECTION_ORDER):
+    rows = probability_summary[
+        (probability_summary["outcome"] == "initial_direction") &
+        (probability_summary["direction"] == direction)
+    ].set_index("scenario").loc[scenario_names]
+    p = rows["probability"].to_numpy() * 100
+    low = rows["mc_95_low"].to_numpy() * 100
+    high = rows["mc_95_high"].to_numpy() * 100
+    err = np.maximum(np.vstack([p-low, high-p]), 0)
+    for ax in axes:
+        ax.bar(x+(k-2)*width, p, width, color=direction_colors[k],
+               label=direction.replace("_", " "), yerr=err, capsize=2)
+        ax.set_xticks(x, [n.replace("_", " ") for n in scenario_names])
+        ax.set_ylabel("Conditional simulated probability (%)")
+        ax.grid(axis="y", alpha=0.25)
+axes[0].set_ylim(0, 105)
+axes[0].set_title("All outcomes; 95% Monte Carlo intervals")
+axes[1].set_ylim(0, 5)
+axes[1].set_title("Same data, 0–5% detail; larger bars clipped")
+axes[0].legend(fontsize=8)
+fig.suptitle("Initial direction under assumed release mechanisms (synthetic data)")
+fig.tight_layout()
+save_figure(fig, "01_direction_probabilities.png")
+
+fig, axes = plt.subplots(2, 3, figsize=(15, 9), sharex="row", sharey="row")
+for col, scenario in enumerate(scenario_names):
+    group = trials[trials["scenario"] == scenario]
+    subset = group.sample(min(1500, len(group)), random_state=SEED)
+    ax = axes[0, col]
+    ax.scatter(subset["vx_after_m_s"], subset["vy_after_m_s"],
+               s=7, alpha=0.2, color=scenario_colors[scenario])
+    ax.set_title(scenario.replace("_", " "))
+    ax.set_xlabel("Rightward velocity (m/s)")
+    ax.set_ylabel("Upward velocity (m/s)")
+    paths = trajectory_data[trajectory_data["scenario"] == scenario]
+    ax = axes[1, col]
+    for _, path in paths.groupby("trial"):
+        ax.plot(path["x_m"]*100, path["y_m"]*100,
+                alpha=0.5, color=scenario_colors[scenario])
+    ax.scatter([0], [0], color="black", s=20)
+    ax.set_xlabel("Rightward displacement (cm)")
+    ax.set_ylabel("Upward displacement (cm)")
+    ax.set_aspect("equal", adjustable="box")
+for ax in axes.flat:
+    ax.axhline(0, color="gray", lw=0.6)
+    ax.axvline(0, color="gray", lw=0.6)
+    ax.grid(alpha=0.2)
+fig.suptitle("Shared scales within each row; trajectories use equal spatial scaling\n"
+             "Velocity: 1,500 sampled trials/scenario. Paths: 12 illustrative trials/scenario.")
+fig.tight_layout(rect=(0, 0, 1, 0.93))
+save_figure(fig, "02_velocities_and_trajectories.png")
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 5), layout="constrained")
+for ax, outcome, title in zip(axes,
+    ["initial_direction", "displacement_direction"],
+    ["Initial velocity direction", f"Displacement direction after {OBSERVATION_TIME_S:.2f} s"]):
+    table = probability_summary[probability_summary["outcome"] == outcome].pivot(
+        index="scenario", columns="direction", values="probability"
+    ).reindex(index=scenario_names, columns=DIRECTION_ORDER)*100
+    image = ax.imshow(table.to_numpy(), vmin=0, vmax=100, cmap="Blues", aspect="auto")
+    ax.set_xticks(range(5), [d.replace("_", "\n") for d in DIRECTION_ORDER])
+    ax.set_yticks(range(3), [s.replace("_", " ") for s in scenario_names])
+    ax.set_title(title)
+    for r in range(3):
+        for c in range(5):
+            value = table.iloc[r, c]
+            ax.text(c, r, f"{value:.2f}%", ha="center", va="center",
+                    color="white" if value > 55 else "black", fontsize=9)
+fig.colorbar(image, ax=axes, label="Conditional simulated probability (%)", shrink=0.8)
+fig.suptitle(f"Synthetic outcomes: environment = {ENVIRONMENT}; 0.00% means zero sampled events")
+save_figure(fig, "03_initial_vs_later_direction.png")
+
+
+# One-factor sensitivity study; these are assumptions, not measurements.
+# Common random numbers reduce random noise between parameter settings.
+SENSITIVITY_N = 10_000
+srng = np.random.default_rng(SEED + 1)
+z = srng.normal(size=(7, SENSITIVITY_N))
+s_mass = np.maximum(MASS_MEAN_KG + MASS_SD_KG*z[0], MASS_MIN_KG)
+
+sensitivity_specs = {
+    "vertical_mean_Ns": np.linspace(-0.004, 0.004, 17),
+    "connector_correlation": np.array([0.0, 0.25, 0.5, 0.8, 0.95, 1.0]),
+    "stationary_threshold_m_s": np.array([0.005, 0.01, 0.02, 0.04, 0.08]),
+    "initial_vy_m_s": np.array([-0.3, -0.1, 0.0, 0.1, 0.3]),
+    "observation_time_s": np.array([0.01, 0.025, 0.05, 0.1, 0.2]),
+}
+sensitivity_rows = []
+for scenario, settings in SCENARIOS.items():
+    for factor, values in sensitivity_specs.items():
+        for value in values:
+            rho = float(value) if factor == "connector_correlation" else CONNECTOR_CORRELATION
+            mu = float(value) if factor == "vertical_mean_Ns" else settings["vertical_impulse_mean_per_side_Ns"]
+            threshold = float(value) if factor == "stationary_threshold_m_s" else STATIONARY_SPEED_M_S
+            initial_vy = float(value) if factor == "initial_vy_m_s" else INITIAL_VY_MEAN_M_S
+            time = float(value) if factor == "observation_time_s" else OBSERVATION_TIME_S
+            noise_scale = np.sqrt(max(0.0, 1-rho**2))
+            jl_x = -np.maximum(HORIZONTAL_IMPULSE_MEAN_NS + HORIZONTAL_IMPULSE_SD_NS*z[3], 0)
+            jr_x = np.maximum(HORIZONTAL_IMPULSE_MEAN_NS + HORIZONTAL_IMPULSE_SD_NS*(rho*z[3]+noise_scale*z[4]), 0)
+            sd = settings["vertical_impulse_sd_per_side_Ns"]
+            jl_y = mu + sd*z[5]
+            jr_y = mu + sd*(rho*z[5]+noise_scale*z[6])
+            vx = INITIAL_VX_MEAN_M_S + INITIAL_VELOCITY_SD_M_S*z[1] + (jl_x+jr_x)/s_mass
+            vy = initial_vy + INITIAL_VELOCITY_SD_M_S*z[2] + (jl_y+jr_y)/s_mass
+            for outcome, u, v in [
+                ("initial_direction", vx, vy),
+                ("displacement_direction", vx, vy + 0.5*GRAVITY_Y*time),
+            ]:
+                labels = np.where(np.abs(v) >= np.abs(u),
+                    np.where(v >= 0, "up", "down"), np.where(u >= 0, "right", "left"))
+                labels = np.where(np.hypot(u, v) < threshold, "nearly_stationary", labels)
+                for direction in DIRECTION_ORDER:
+                    count = int(np.sum(labels == direction))
+                    low, high = wilson_interval(count, SENSITIVITY_N)
+                    sensitivity_rows.append({
+                        "scenario": scenario, "factor": factor, "value": float(value),
+                        "outcome": outcome, "direction": direction,
+                        "count": count, "total_trials": SENSITIVITY_N,
+                        "probability": count/SENSITIVITY_N,
+                        "mc_95_low": low, "mc_95_high": high,
+                    })
+sensitivity_results = pd.DataFrame(sensitivity_rows)
+sensitivity_results.to_csv(OUTPUT_DIR / "sensitivity_results.csv", index=False)
+
+# Balanced scenario highlights changes that saturation can hide.
+selected_scenario = "near_balanced_release"
+fig, axes = plt.subplots(2, 3, figsize=(16, 9), layout="constrained")
+for ax, factor in zip(axes.flat, sensitivity_specs):
+    outcome = "displacement_direction" if factor == "observation_time_s" else "initial_direction"
+    part = sensitivity_results[
+        (sensitivity_results["scenario"] == selected_scenario) &
+        (sensitivity_results["factor"] == factor) &
+        (sensitivity_results["outcome"] == outcome)]
+    for direction, color in zip(DIRECTION_ORDER, direction_colors):
+        rows = part[part["direction"] == direction].sort_values("value")
+        ax.plot(rows["value"], rows["probability"]*100, "o-", ms=3,
+                label=direction.replace("_", " "), color=color)
+    ax.set_xlabel(factor.replace("_", " "))
+    ax.set_ylabel("Conditional simulated probability (%)")
+    ax.set_title(outcome.replace("_", " "))
+    ax.set_ylim(-2, 102)
+    ax.grid(alpha=0.25)
+axes.flat[-1].axis("off")
+handles, labels = axes.flat[0].get_legend_handles_labels()
+axes.flat[-1].legend(handles, labels, loc="center", title="Direction")
+fig.suptitle("One-factor sensitivity: near-balanced scenario\n"
+             "All scenarios exported to CSV; curves are not physical measurements")
+save_figure(fig, "04_sensitivity_analysis.png")
+print("Sensitivity rows:", len(sensitivity_results))
+print("Common random numbers are reused across settings; curve points are not independent experiments.")
+
+
+from pathlib import Path
+from textwrap import dedent
+
+# ============================================================
+# SCIENTIFIC RESEARCH REPORT
+#
+# Run after the simulation to include calculated results.
+# This cell does not rerun or modify the simulation.
+# It requires only Python's standard library.
+# ============================================================
+
+
+def build_highlighter_research_report(namespace):
+    """
+    Build a research report using the simulation configuration
+    and probability summary available in the current notebook.
+
+    If results are unavailable or malformed, the report explains
+    that instead of inventing numerical findings.
+    """
+
+    scenario_settings = namespace.get("SCENARIOS")
+    summary = namespace.get("probability_summary")
+
+    trials_per_scenario = namespace.get(
+        "TRIALS_PER_SCENARIO",
+        "not available",
+    )
+
+    seed = namespace.get("SEED", "not available")
+
+    environment = namespace.get(
+        "ENVIRONMENT",
+        "not available",
+    )
+
+    observation_time = namespace.get(
+        "OBSERVATION_TIME_S",
+        "not available",
+    )
+
+    stationary_threshold = namespace.get(
+        "STATIONARY_SPEED_M_S",
+        "not available",
+    )
+
+    direction_order = [
+        "up",
+        "down",
+        "left",
+        "right",
+        "nearly_stationary",
+    ]
+
+    sections = []
+
+    def add(text):
+        sections.append(dedent(text).strip())
+
+    add("""
+    DIRECTIONAL MOTION OF A MIDDLE HIGHLIGHTER
+    FOLLOWING SYMMETRIC SNAP RELEASE
+
+    A Monte Carlo Computational Modeling Study
+    """)
+
+    add("""
+    ABSTRACT
+
+    This study investigates the initial motion of a middle
+    highlighter when three highlighters are connected side by
+    side and the bottom ends of the two outer highlighters are
+    pulled downward until both connections release.
+
+    The release event is represented through the impulses
+    transmitted by the left and right connectors. Three
+    hypothetical release mechanisms are compared: downward
+    drag, upward recoil, and nearly balanced release.
+
+    Monte Carlo sampling introduces variability in mass,
+    pre-release velocity, and connector impulses. The resulting
+    motion is classified as up, down, left, right, or nearly
+    stationary. Initial motion is distinguished from later
+    displacement after complete separation.
+
+    This is an exploratory computational study. Its numerical
+    probabilities are conditional on assumed inputs and should
+    not be presented as experimentally measured probabilities
+    for the actual highlighters.
+    """)
+
+    add("""
+    1. RESEARCH QUESTION
+
+    When three highlighters are snapped together side by side,
+    and downward forces applied to the bottom ends of the two
+    outer highlighters cause both connections to release,
+    what determines the initial direction of the middle
+    highlighter?
+
+    Subsidiary questions:
+
+    1. How does the net connector impulse affect initial motion?
+    2. How does left-right symmetry affect lateral motion?
+    3. How does release variability affect direction frequencies?
+    4. How does initial motion differ from later displacement?
+
+    The middle highlighter is not independently clamped or
+    held by a hand. Before release, it is connected to the outer
+    highlighters through the snap connections.
+    """)
+
+    add("""
+    2. PHYSICAL FRAMEWORK
+
+    The middle highlighter can receive forces through its
+    connectors even though no hand directly touches it.
+
+    The model summarizes the short release event using the
+    impulse-momentum relationship:
+
+        J_net = m * (v_after - v_before)
+
+    Therefore:
+
+        v_after = v_before + (J_left + J_right) / m
+
+    These are vector equations. Their horizontal and vertical
+    components are evaluated separately.
+
+    Coordinate convention:
+
+        Positive x: right
+        Negative x: left
+        Positive y: up
+        Negative y: down
+
+    Equal and opposite horizontal connector impulses cancel.
+    Their vertical components do not necessarily cancel.
+
+    The model does not assume that the middle highlighter
+    automatically moves in the direction of the hand forces.
+    """)
+
+    add("""
+    3. HYPOTHESES
+
+    Primary hypothesis:
+
+    The middle highlighter's initial motion depends on its
+    pre-release velocity and the net impulse delivered during
+    connector disengagement.
+
+    Symmetry hypothesis:
+
+    Exactly mirrored horizontal impulses produce no change in
+    horizontal momentum. Small mismatches permit lateral motion,
+    but mirror-symmetric input distributions should not favor
+    left over right systematically.
+
+    Competing release hypotheses:
+
+    H1: Downward drag
+        Predominantly downward connector impulses should favor
+        downward initial motion.
+
+    H2: Upward recoil
+        Predominantly upward connector impulses should favor
+        upward initial motion.
+
+    H3: Nearly balanced release
+        Small net release impulses should produce relatively
+        low speeds and greater sensitivity to small fluctuations.
+
+    These are alternative assumed mechanisms. Equal numbers
+    of simulated trials do not establish equal real-world
+    probabilities for the mechanisms.
+    """)
+
+    add(f"""
+    4. METHOD
+
+    4.1 Study design
+
+    Repeated synthetic releases are generated under each
+    hypothetical release mechanism.
+
+    Current notebook configuration:
+
+        Trials per scenario: {trials_per_scenario}
+        Random seed: {seed}
+        Environment: {environment}
+        Observation time after release: {observation_time} s
+        Nearly stationary speed threshold:
+            {stationary_threshold} m/s
+
+    The seed supports reproducible sampling. Reproducibility
+    does not establish physical validity.
+    """)
+
+    parameter_names = [
+        ("MASS_MEAN_KG", "Mean mass", "kg"),
+        ("MASS_SD_KG", "Mass standard deviation", "kg"),
+        ("MASS_MIN_KG", "Minimum mass", "kg"),
+        (
+            "INITIAL_VX_MEAN_M_S",
+            "Mean pre-release horizontal velocity",
+            "m/s",
+        ),
+        (
+            "INITIAL_VY_MEAN_M_S",
+            "Mean pre-release vertical velocity",
+            "m/s",
+        ),
+        (
+            "INITIAL_VELOCITY_SD_M_S",
+            "Pre-release velocity standard deviation",
+            "m/s",
+        ),
+        (
+            "HORIZONTAL_IMPULSE_MEAN_NS",
+            "Mean horizontal impulse magnitude per side",
+            "N*s",
+        ),
+        (
+            "HORIZONTAL_IMPULSE_SD_NS",
+            "Horizontal impulse standard deviation",
+            "N*s",
+        ),
+        (
+            "CONNECTOR_CORRELATION",
+            "Connector input correlation",
+            "",
+        ),
+    ]
+
+    parameter_lines = [
+        "4.2 Input assumptions",
+        "",
+        "Available settings from the current notebook:",
+        "",
+    ]
+
+    for key, label, unit in parameter_names:
+        value = namespace.get(key, "not available")
+        parameter_lines.append(
+            f"    {label}: {value} {unit}".rstrip()
+        )
+
+    parameter_lines.extend([
+        "",
+        "These inputs are illustrative assumptions unless",
+        "independently replaced with measured values.",
+    ])
+
+    sections.append("\n".join(parameter_lines))
+
+    scenario_lines = [
+        "4.3 Release scenarios",
+        "",
+    ]
+
+    if isinstance(scenario_settings, dict) and scenario_settings:
+        for name, settings in scenario_settings.items():
+            scenario_lines.append(
+                name.replace("_", " ").title()
+            )
+
+            if isinstance(settings, dict):
+                mean = settings.get(
+                    "vertical_impulse_mean_per_side_Ns",
+                    "not available",
+                )
+
+                sd = settings.get(
+                    "vertical_impulse_sd_per_side_Ns",
+                    "not available",
+                )
+
+                scenario_lines.extend([
+                    f"    Mean vertical impulse per side: {mean} N*s",
+                    f"    Standard deviation per side: {sd} N*s",
+                    "",
+                ])
+            else:
+                scenario_lines.append(
+                    "    Scenario settings could not be read."
+                )
+    else:
+        scenario_lines.extend([
+            "Scenario settings are not available.",
+            "Run the main simulation cell to populate them.",
+        ])
+
+    sections.append("\n".join(scenario_lines))
+
+    add("""
+    4.4 Trial procedure
+
+    For each synthetic release, the program:
+
+    1. Samples the middle highlighter's mass.
+    2. Samples its pre-release velocity.
+    3. Samples left and right horizontal impulses.
+    4. Samples vertical impulses for the selected scenario.
+    5. Adds the impulses to obtain the net release impulse.
+    6. Calculates the post-release velocity.
+    7. Classifies the initial direction.
+    8. Calculates later displacement.
+    9. Saves trial inputs and outcomes.
+
+    The release is approximated as instantaneous. The model
+    does not resolve connector deformation or the exact order
+    in which the connections disengage.
+    """)
+
+    add("""
+    4.5 Direction classification
+
+    Speed is calculated as:
+
+        speed = sqrt(vx_after**2 + vy_after**2)
+
+    Trials below the configured speed threshold are classified
+    as nearly stationary.
+
+    Otherwise, the direction is assigned using the velocity
+    component with the greater absolute magnitude.
+
+    A positive dominant vertical component is classified as up.
+    A negative dominant vertical component is classified as down.
+    A positive dominant horizontal component is classified as right.
+    A negative dominant horizontal component is classified as left.
+
+    Diagonal motion is possible. The separate diagonal flag
+    identifies trials in which the smaller velocity component
+    is at least half the larger component, excluding nearly
+    stationary trials.
+
+    The stationary threshold and diagonal criterion are analysis
+    choices, not physical boundaries.
+    """)
+
+    add("""
+    4.6 Post-release trajectories
+
+    After release, connector impulses no longer act.
+
+    The trajectory equations are:
+
+        x(t) = vx_after * t
+        y(t) = vy_after * t + 0.5 * gravity_y * t**2
+
+    In air mode, gravity acts downward.
+
+    In ideal-plane mode, the modeled in-plane gravitational
+    acceleration is zero. This represents an ideal frictionless
+    horizontal surface viewed from above, not a realistic
+    tabletop with friction.
+
+    Initial launch direction and later displacement direction
+    are evaluated separately.
+    """)
+
+    add("""
+    4.7 Probability estimation and uncertainty
+
+    For each scenario:
+
+        estimated_probability = direction_count / total_trials
+
+    The probabilities are conditional on the scenario and
+    its assumed input distributions.
+
+    Approximate 95% Wilson intervals describe finite-sample
+    Monte Carlo variability.
+
+    They do not account for incorrect connector physics,
+    unmeasured input distributions, or omitted mechanisms.
+
+    More trials improve numerical precision under the model.
+    They do not, by themselves, establish that the model
+    describes the real highlighters.
+    """)
+
+    # --------------------------------------------------------
+    # Read actual simulation results if they are available.
+    # --------------------------------------------------------
+
+    required_columns = {
+        "scenario",
+        "outcome",
+        "direction",
+        "probability",
+        "mc_95_low",
+        "mc_95_high",
+    }
+
+    results_available = (
+        summary is not None
+        and hasattr(summary, "columns")
+        and required_columns.issubset(set(summary.columns))
+    )
+
+    calculated_findings = []
+
+    if results_available:
+        result_lines = [
+            "5. COMPUTATIONAL RESULTS",
+            "",
+            "The following values are read from the current",
+            "probability_summary table, not generated by",
+            "this report cell.",
+            "",
+            "Intervals reflect Monte Carlo sampling variability only.",
+            "",
+        ]
+
+        scenario_order = (
+            summary["scenario"].drop_duplicates().tolist()
+        )
+
+        for scenario in scenario_order:
+            result_lines.append(
+                str(scenario).replace("_", " ").title()
+            )
+
+            for outcome, label in (
+                ("initial_direction", "Initial direction"),
+                (
+                    "displacement_direction",
+                    "Later displacement direction",
+                ),
+            ):
+                subset = summary[
+                    (summary["scenario"] == scenario)
+                    & (summary["outcome"] == outcome)
+                ]
+
+                result_lines.append(f"    {label}:")
+
+                if subset.empty:
+                    result_lines.append(
+                        "        No results available."
+                    )
+                    continue
+
+                for direction in direction_order:
+                    rows = subset[
+                        subset["direction"] == direction
+                    ]
+
+                    if rows.empty:
+                        continue
+
+                    row = rows.iloc[0]
+
+                    probability = 100.0 * float(
+                        row["probability"]
+                    )
+
+                    low = 100.0 * float(row["mc_95_low"])
+                    high = 100.0 * float(row["mc_95_high"])
+
+                    readable_direction = direction.replace(
+                        "_",
+                        " ",
+                    )
+
+                    result_lines.append(
+                        f"        {readable_direction}: "
+                        f"{probability:.2f}% "
+                        f"(MC 95% interval: "
+                        f"{low:.2f}% to {high:.2f}%)"
+                    )
+
+                if outcome == "initial_direction":
+                    maximum_probability = float(
+                        subset["probability"].max()
+                    )
+
+                    leaders = subset[
+                        (
+                            subset["probability"]
+                            - maximum_probability
+                        ).abs() < 1e-12
+                    ]
+
+                    leader_names = ", ".join(
+                        str(value).replace("_", " ")
+                        for value in leaders["direction"]
+                    )
+
+                    calculated_findings.append(
+                        f"Under {str(scenario).replace('_', ' ')} "
+                        f"assumptions, the most frequent initial "
+                        f"category or tied categories were "
+                        f"{leader_names} "
+                        f"({100.0 * maximum_probability:.2f}% each)."
+                    )
+
+            result_lines.append("")
+
+        sections.append("\n".join(result_lines))
+
+    else:
+        add("""
+        5. COMPUTATIONAL RESULTS
+
+        A compatible probability_summary table was not found.
+
+        No numerical findings are reported. Run the simulation
+        cell and then rerun this report cell to include the
+        calculated direction probabilities.
+
+        The absence of results does not support or reject any
+        release mechanism.
+        """)
+
+    add("""
+    6. DISCUSSION
+
+    This simulation compares the consequences of competing
+    release assumptions. It does not discover the connector
+    mechanism independently.
+
+    A high upward probability under the upward-recoil scenario
+    is not independent evidence that the real connectors recoil
+    upward: upward impulse was an input assumption.
+
+    Likewise, a high downward probability under the downward-drag
+    scenario does not establish downward motion as the real
+    experimental outcome.
+
+    The balanced scenario helps examine sensitivity to small
+    impulses, initial velocities, and asymmetries.
+
+    The comparison between initial direction and later
+    displacement prevents gravitational falling from being
+    mistaken for evidence about the original launch direction.
+    """)
+
+    add("""
+    7. LIMITATIONS
+
+    1. Connector impulses are assumed rather than measured.
+    2. Only the middle highlighter's translation is modeled.
+    3. Rotation and torque are omitted.
+    4. Connector deformation is not resolved.
+    5. Release timing differences are not explicitly modeled.
+    6. Collisions with the outer highlighters are omitted.
+    7. Surface friction and air resistance are omitted.
+    8. Ground impact is not modeled.
+    9. Gravity during the short release event is neglected.
+    10. Direction frequencies depend on the chosen distributions.
+    11. No occurrence probabilities are assigned to the scenarios.
+    12. The stationary threshold affects classification.
+
+    These limitations restrict the conclusions to the modeled
+    conditions and prevent a definitive real-world prediction.
+    """)
+
+    add("""
+    8. EXPERIMENTAL VALIDATION PLAN
+
+    Record repeated physical releases with a visible length
+    reference and a known video frame rate.
+
+    For each trial, measure or document:
+
+    - Middle-highlighter mass.
+    - Position immediately before and after separation.
+    - Horizontal and vertical velocity before release.
+    - Horizontal and vertical velocity after release.
+    - Whether the two connections release simultaneously.
+    - Whether the middle highlighter rotates.
+    - Whether contact with another object occurs.
+    - Whether the apparatus is suspended or supported.
+
+    Estimate the net release impulse from:
+
+        J_net = mass * (v_after - v_before)
+
+    Account for significant external impulses during the
+    measurement interval.
+
+    Translation of the middle highlighter alone identifies
+    the net impulse, not the individual connector impulses.
+
+    Calibrate assumed distributions with one set of measurements
+    and, where feasible, evaluate predictive performance using
+    separate trials.
+    """)
+
+    add("""
+    9. REPRODUCIBILITY AND DATA INTEGRITY
+
+    Retain the random seed, parameter settings, software versions,
+    trial-level data, probability summaries, and figure outputs.
+
+    Keep synthetic data separate from experimental measurements.
+
+    Do not describe the number of simulated trials as the number
+    of physical experiments.
+
+    Changing parameter values requires regenerating the simulated
+    results. This report reads available notebook variables; it
+    cannot detect whether those variables were changed after the
+    simulation ran.
+
+    For a consistent report, rerun the simulation, visualizations,
+    and report in order without changing settings between them.
+    """)
+
+    conclusion = [
+        "10. CONCLUSION",
+        "",
+    ]
+
+    if calculated_findings:
+        conclusion.extend(calculated_findings)
+        conclusion.append("")
+
+    conclusion.extend([
+        "The model relates the middle highlighter's initial motion",
+        "to its pre-release velocity and the net connector impulse.",
+        "",
+        "Exact horizontal symmetry cancels the modeled horizontal",
+        "release impulse, but does not determine the vertical impulse.",
+        "Upward motion, downward motion, and little initial movement",
+        "are therefore possible under different release assumptions.",
+        "",
+        "The reported probabilities are conditional computational",
+        "results, not established probabilities for the real objects.",
+        "",
+        "The actual connector mechanism must be measured before one",
+        "direction can be identified as the expected outcome for the",
+        "physical highlighters. The simulation provides a framework",
+        "for testing that question rather than a substitute for",
+        "experimental evidence.",
+    ])
+
+    sections.append("\n".join(conclusion))
+
+    return "\n\n" + ("\n\n" + "=" * 72 + "\n\n").join(sections)
+
+
+# Build and display the report.
+report_namespace = dict(globals())
+config_to_variable = {
+    "seed": "SEED", "trials_per_scenario": "TRIALS_PER_SCENARIO",
+    "environment": "ENVIRONMENT", "observation_time_s": "OBSERVATION_TIME_S",
+    "stationary_speed_threshold_m_s": "STATIONARY_SPEED_M_S",
+    "mass_mean_kg": "MASS_MEAN_KG", "mass_sd_kg": "MASS_SD_KG",
+    "mass_min_kg": "MASS_MIN_KG", "initial_vx_mean_m_s": "INITIAL_VX_MEAN_M_S",
+    "initial_vy_mean_m_s": "INITIAL_VY_MEAN_M_S",
+    "initial_velocity_sd_m_s": "INITIAL_VELOCITY_SD_M_S",
+    "horizontal_impulse_mean_per_side_Ns": "HORIZONTAL_IMPULSE_MEAN_NS",
+    "horizontal_impulse_sd_per_side_Ns": "HORIZONTAL_IMPULSE_SD_NS",
+    "connector_correlation": "CONNECTOR_CORRELATION", "scenarios": "SCENARIOS",
+}
+for config_key, variable in config_to_variable.items():
+    report_namespace[variable] = RUN_CONFIGURATION[config_key]
+research_report = build_highlighter_research_report(report_namespace)
+
+print(research_report)
+
+# Save a plain-text copy without requiring pandas or NumPy.
+report_directory = Path("highlighter_release_results")
+report_directory.mkdir(parents=True, exist_ok=True)
+
+report_path = report_directory / "scientific_research_report.txt"
+
+report_path.write_text(
+    research_report,
+    encoding="utf-8",
+)
+
+print("\nReport saved to:", report_path.resolve())
+appendix = "\n\nAPPENDIX: VERIFICATION AND SENSITIVITY\n\n"
+appendix += f"Verification checks passed: {int(verification['passed'].sum())}/{len(verification)}.\n"
+appendix += "Verification checks equations and implementation, not physical realism.\n"
+appendix += f"Sensitivity trials per setting: {SENSITIVITY_N:,}.\n"
+appendix += "One factor is varied at a time; interactions are not exhaustively studied.\n"
+appendix += "Common random numbers are reused across settings.\n"
+appendix += "Complete sensitivity tables and plots accompany the baseline results.\n"
+appendix += "No experimental observations were used to calibrate these inputs.\n"
+research_report += appendix
+report_path.write_text(research_report, encoding="utf-8")
+print(appendix)
+
+
+# Record file integrity and the exact generating software configuration.
+import hashlib
+manifest = {"configuration": RUN_CONFIGURATION, "files": {}}
+for path in sorted(OUTPUT_DIR.iterdir()):
+    if path.is_file() and path.name != "run_manifest.json":
+        payload = path.read_bytes()
+        assert len(payload) > 0, f"Empty output: {path.name}"
+        manifest["files"][path.name] = {
+            "bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+with (OUTPUT_DIR / "run_manifest.json").open("w", encoding="utf-8") as file:
+    json.dump(manifest, file, indent=2)
+print("Recorded", len(manifest["files"]), "nonempty output files.")
+print("Synthetic study complete. Real-world validation is still required.")
